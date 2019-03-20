@@ -5,12 +5,13 @@ to calculate clear sky GHI, DNI, and DHI.
 
 from __future__ import division
 
+import calendar
 import os
 from collections import OrderedDict
-import calendar
 
 import numpy as np
 import pandas as pd
+from scipy import interpolate
 
 from pvlib import atmosphere, tools
 
@@ -101,47 +102,39 @@ def ineichen(apparent_zenith, airmass_absolute, linke_turbidity,
 
     tl = linke_turbidity
 
-    fh1 = np.exp(-altitude/8000.)
-    fh2 = np.exp(-altitude/1250.)
+    fh1 = np.exp(-altitude / 8000.)
+    fh2 = np.exp(-altitude / 1250.)
     cg1 = 5.09e-05 * altitude + 0.868
     cg2 = 3.92e-05 * altitude + 0.0387
 
-    ghi = np.exp(-cg2*airmass_absolute*(fh1 + fh2*(tl - 1)))
+    ghi = np.exp(-cg2 * airmass_absolute * (fh1 + fh2 * (tl - 1)))
 
     # https://github.com/pvlib/pvlib-python/issues/435
     if perez_enhancement:
-        ghi *= np.exp(0.01*airmass_absolute**1.8)
+        ghi *= np.exp(0.01 * airmass_absolute ** 1.8)
 
     # use fmax to map airmass nans to 0s. multiply and divide by tl to
     # reinsert tl nans
     ghi = cg1 * dni_extra * cos_zenith * tl / tl * np.fmax(ghi, 0)
 
     # BncI = "normal beam clear sky radiation"
-    b = 0.664 + 0.163/fh1
+    b = 0.664 + 0.163 / fh1
     bnci = b * np.exp(-0.09 * airmass_absolute * (tl - 1))
     bnci = dni_extra * np.fmax(bnci, 0)
 
     # "empirical correction" SE 73, 157 & SE 73, 312.
-    bnci_2 = ((1 - (0.1 - 0.2*np.exp(-tl))/(0.1 + 0.882/fh1)) /
+    bnci_2 = ((1 - (0.1 - 0.2 * np.exp(-tl)) / (0.1 + 0.882 / fh1)) /
               cos_zenith)
     bnci_2 = ghi * np.fmin(np.fmax(bnci_2, 0), 1e20)
 
     dni = np.minimum(bnci, bnci_2)
 
-    dhi = ghi - dni*cos_zenith
+    dhi = ghi - dni * cos_zenith
 
-    irrads = OrderedDict()
-    irrads['ghi'] = ghi
-    irrads['dni'] = dni
-    irrads['dhi'] = dhi
-
-    if isinstance(dni, pd.Series):
-        irrads = pd.DataFrame.from_dict(irrads)
-
-    return irrads
+    return ghi
 
 
-def lookup_linke_turbidity(time, latitude, longitude, filepath=None,
+def lookup_linke_turbidity(time, lats_1d, lons_1d, grid=False, filepath=None,
                            interp_turbidity=True):
     """
     Look up the Linke Turibidity from the ``LinkeTurbidities.h5``
@@ -184,43 +177,46 @@ def lookup_linke_turbidity(time, latitude, longitude, filepath=None,
     # 1st row: 89.9583 S, 2nd row: 89.875 S
     # 1st column: 179.9583 W, 2nd column: 179.875 W
 
-    try:
-        import tables
-    except ImportError:
-        raise ImportError('The Linke turbidity lookup table requires tables. '
-                          'You can still use clearsky.ineichen if you '
-                          'supply your own turbidities.')
+    linke_latitudes, linke_longitudes, linke_turbidity_data = get_linke_turbidity_world()
 
-    if filepath is None:
-        pvlib_path = os.path.dirname(os.path.abspath(__file__))
-        filepath = os.path.join(pvlib_path, 'data', 'LinkeTurbidities.h5')
+    # daynumber for every 15-th day of the month; including a leading dec and trailing jan
+    daynumber = [-15, 15, 46, 74, 105, 135, 166, 196, 227, 258, 288, 319, 349, 379]
 
-    latitude_index = (
-        np.around(_linearly_scale(latitude, 90, -90, 0, 2160))
-        .astype(np.int64))
-    longitude_index = (
-        np.around(_linearly_scale(longitude, -180, 180, 0, 4320))
-        .astype(np.int64))
+    if time.day <= 15:
+        first_index = time.month - 1
+    else:
+        first_index = time.month
+
+    linke_time_interpolation_function = interpolate.interp1d(daynumber[first_index:first_index + 2],
+                                                             linke_turbidity_data[:, :,
+                                                             first_index:first_index + 2] / 20)
+
+    linke_turbidity_interpolator = interpolate.RectBivariateSpline(linke_latitudes, linke_longitudes,
+                                                                   linke_time_interpolation_function(
+                                                                       time.timetuple().tm_yday))
+
+
+    return linke_turbidity_interpolator(lats_1d, lons_1d, grid=grid)
+
+
+def get_linke_turbidity_world():
+    import tables
+    pvlib_path = os.path.dirname(os.path.abspath(__file__))
+    filepath = os.path.join(pvlib_path, 'data', 'LinkeTurbidities.h5')
+
+    linke_latitudes = np.arange(-90, 90, 1 / 12)
+    linke_longitudes = np.arange(-180, 180, 1 / 12)
 
     lt_h5_file = tables.open_file(filepath)
-    try:
-        lts = lt_h5_file.root.LinkeTurbidity[latitude_index,
-                                             longitude_index, :]
-    except IndexError:
-        raise IndexError('Latitude should be between 90 and -90, '
-                         'longitude between -180 and 180.')
-    finally:
-        lt_h5_file.close()
+    linke_turbidity_all_months = lt_h5_file.root.LinkeTurbidity[:, :, :]
+    lt_h5_file.close()
 
-    if interp_turbidity:
-        linke_turbidity = _interpolate_turbidity(lts, time)
-    else:
-        months = time.month - 1
-        linke_turbidity = pd.Series(lts[months], index=time)
+    # add dec before and jan after for easier time interpolation
+    linke_turbidity_data = np.dstack((linke_turbidity_all_months[:, :, 11],
+                                      linke_turbidity_all_months[:, :, :],
+                                      linke_turbidity_all_months[:, :, 0]))
 
-    linke_turbidity /= 20.
-
-    return linke_turbidity
+    return linke_latitudes, linke_longitudes, linke_turbidity_data
 
 
 def _is_leap_year(year):
@@ -305,7 +301,7 @@ def _linearly_scale(inputmatrix, inputmin, inputmax, outputmin, outputmax):
     """linearly scale input to output, used by Linke turbidity lookup"""
     inputrange = inputmax - inputmin
     outputrange = outputmax - outputmin
-    delta = outputrange/inputrange  # number of indices per input unit
+    delta = outputrange / inputrange  # number of indices per input unit
     inputmin = inputmin + 1.0 / delta / 2.0  # shift to center of index
     outputmax = outputmax - 1  # shift index to zero indexing
     outputmatrix = (inputmatrix - inputmin) * delta + outputmin
@@ -367,7 +363,7 @@ def haurwitz(apparent_zenith):
     clearsky_ghi = np.zeros_like(apparent_zenith.values)
     cos_zen_gte_0 = cos_zenith > 0
     clearsky_ghi[cos_zen_gte_0] = (1098.0 * cos_zenith[cos_zen_gte_0] *
-                                   np.exp(-0.059/cos_zenith[cos_zen_gte_0]))
+                                   np.exp(-0.059 / cos_zenith[cos_zen_gte_0]))
 
     df_out = pd.DataFrame(index=apparent_zenith.index,
                           data=clearsky_ghi,
@@ -452,9 +448,9 @@ def simplified_solis(apparent_elevation, aod700=0.1, precipitable_water=1.,
     # it's also friendly to scalar and series inputs
     sin_elev = np.maximum(1.e-30, np.sin(np.radians(apparent_elevation)))
 
-    dni = i0p * np.exp(-taub/sin_elev**b)
-    ghi = i0p * np.exp(-taug/sin_elev**g) * sin_elev
-    dhi = i0p * np.exp(-taud/sin_elev**d)
+    dni = i0p * np.exp(-taub / sin_elev ** b)
+    ghi = i0p * np.exp(-taug / sin_elev ** g) * sin_elev
+    dhi = i0p * np.exp(-taud / sin_elev ** d)
 
     irrads = OrderedDict()
     irrads['ghi'] = ghi
@@ -470,10 +466,10 @@ def simplified_solis(apparent_elevation, aod700=0.1, precipitable_water=1.,
 def _calc_i0p(i0, w, aod700, p):
     """Calculate the "enhanced extraterrestrial irradiance"."""
     p0 = 101325.
-    io0 = 1.08 * w**0.0051
-    i01 = 0.97 * w**0.032
-    i02 = 0.12 * w**0.56
-    i0p = i0 * (i02*aod700**2 + i01*aod700 + io0 + 0.071*np.log(p/p0))
+    io0 = 1.08 * w ** 0.0051
+    i01 = 0.97 * w ** 0.032
+    i02 = 0.12 * w ** 0.56
+    i0p = i0 * (i02 * aod700 ** 2 + i01 * aod700 + io0 + 0.071 * np.log(p / p0))
 
     return i0p
 
@@ -481,11 +477,11 @@ def _calc_i0p(i0, w, aod700, p):
 def _calc_taub(w, aod700, p):
     """Calculate the taub coefficient"""
     p0 = 101325.
-    tb1 = 1.82 + 0.056*np.log(w) + 0.0071*np.log(w)**2
-    tb0 = 0.33 + 0.045*np.log(w) + 0.0096*np.log(w)**2
-    tbp = 0.0089*w + 0.13
+    tb1 = 1.82 + 0.056 * np.log(w) + 0.0071 * np.log(w) ** 2
+    tb0 = 0.33 + 0.045 * np.log(w) + 0.0096 * np.log(w) ** 2
+    tbp = 0.0089 * w + 0.13
 
-    taub = tb1*aod700 + tb0 + tbp*np.log(p/p0)
+    taub = tb1 * aod700 + tb0 + tbp * np.log(p / p0)
 
     return taub
 
@@ -493,8 +489,8 @@ def _calc_taub(w, aod700, p):
 def _calc_b(w, aod700):
     """Calculate the b coefficient."""
 
-    b1 = 0.00925*aod700**2 + 0.0148*aod700 - 0.0172
-    b0 = -0.7565*aod700**2 + 0.5057*aod700 + 0.4557
+    b1 = 0.00925 * aod700 ** 2 + 0.0148 * aod700 - 0.0172
+    b0 = -0.7565 * aod700 ** 2 + 0.5057 * aod700 + 0.4557
 
     b = b1 * np.log(w) + b0
 
@@ -504,10 +500,10 @@ def _calc_b(w, aod700):
 def _calc_taug(w, aod700, p):
     """Calculate the taug coefficient"""
     p0 = 101325.
-    tg1 = 1.24 + 0.047*np.log(w) + 0.0061*np.log(w)**2
-    tg0 = 0.27 + 0.043*np.log(w) + 0.0090*np.log(w)**2
-    tgp = 0.0079*w + 0.1
-    taug = tg1*aod700 + tg0 + tgp*np.log(p/p0)
+    tg1 = 1.24 + 0.047 * np.log(w) + 0.0061 * np.log(w) ** 2
+    tg0 = 0.27 + 0.043 * np.log(w) + 0.0090 * np.log(w) ** 2
+    tgp = 0.0079 * w + 0.1
+    taug = tg1 * aod700 + tg0 + tgp * np.log(p / p0)
 
     return taug
 
@@ -515,7 +511,7 @@ def _calc_taug(w, aod700, p):
 def _calc_g(w, aod700):
     """Calculate the g coefficient."""
 
-    g = -0.0147*np.log(w) - 0.3079*aod700**2 + 0.2846*aod700 + 0.3798
+    g = -0.0147 * np.log(w) - 0.3079 * aod700 ** 2 + 0.2846 * aod700 + 0.3798
 
     return g
 
@@ -542,18 +538,18 @@ def _calc_taud(w, aod700, p):
 
     # create tuples of coefficients for
     # aod700 < 0.05, aod700 >= 0.05
-    td4 = 86*w - 13800, -0.21*w + 11.6
-    td3 = -3.11*w + 79.4, 0.27*w - 20.7
-    td2 = -0.23*w + 74.8, -0.134*w + 15.5
-    td1 = 0.092*w - 8.86, 0.0554*w - 5.71
-    td0 = 0.0042*w + 3.12, 0.0057*w + 2.94
-    tdp = -0.83*(1+aod700)**(-17.2), -0.71*(1+aod700)**(-15.0)
+    td4 = 86 * w - 13800, -0.21 * w + 11.6
+    td3 = -3.11 * w + 79.4, 0.27 * w - 20.7
+    td2 = -0.23 * w + 74.8, -0.134 * w + 15.5
+    td1 = 0.092 * w - 8.86, 0.0554 * w - 5.71
+    td0 = 0.0042 * w + 3.12, 0.0057 * w + 2.94
+    tdp = -0.83 * (1 + aod700) ** (-17.2), -0.71 * (1 + aod700) ** (-15.0)
 
     tds = (np.array([td0, td1, td2, td3, td4, tdp]) * aod700_mask).sum(axis=1)
 
     p0 = 101325.
-    taud = (tds[4]*aod700**4 + tds[3]*aod700**3 + tds[2]*aod700**2 +
-            tds[1]*aod700 + tds[0] + tds[5]*np.log(p/p0))
+    taud = (tds[4] * aod700 ** 4 + tds[3] * aod700 ** 3 + tds[2] * aod700 ** 2 +
+            tds[1] * aod700 + tds[0] + tds[5] * np.log(p / p0))
 
     # be polite about matching the output type to the input type(s)
     if len(taud) == 1:
@@ -566,8 +562,8 @@ def _calc_d(aod700, p):
     """Calculate the d coefficient."""
 
     p0 = 101325.
-    dp = 1/(18 + 152*aod700)
-    d = -0.337*aod700**2 + 0.63*aod700 + 0.116 + dp*np.log(p/p0)
+    dp = 1 / (18 + 152 * aod700)
+    d = -0.337 * aod700 ** 2 + 0.63 * aod700 + 0.116 + dp * np.log(p / p0)
 
     return d
 
@@ -684,7 +680,7 @@ def detect_clearsky(measured, clearsky, times, window_length,
 
     # generate matrix of integers for creating windows with indexing
     from scipy.linalg import hankel
-    H = hankel(np.arange(intervals_per_window),                   # noqa: N806
+    H = hankel(np.arange(intervals_per_window),  # noqa: N806
                np.arange(intervals_per_window - 1, len(times)))
 
     # calculate measurement statistics
@@ -715,8 +711,8 @@ def detect_clearsky(measured, clearsky, times, window_length,
         line_diff = meas_line_length - clear_line_length
 
         # evaluate comparison criteria
-        c1 = np.abs(meas_mean - alpha*clear_mean) < mean_diff
-        c2 = np.abs(meas_max - alpha*clear_max) < max_diff
+        c1 = np.abs(meas_mean - alpha * clear_mean) < mean_diff
+        c2 = np.abs(meas_max - alpha * clear_max) < max_diff
         c3 = (line_diff > lower_line_length) & (line_diff < upper_line_length)
         c4 = meas_slope_nstd < var_diff
         c5 = np.max(np.abs(meas_slope -
@@ -735,10 +731,10 @@ def detect_clearsky(measured, clearsky, times, window_length,
         clear_clear = clearsky[clear_samples]
 
         def rmse(alpha):
-            return np.sqrt(np.mean((clear_meas - alpha*clear_clear)**2))
+            return np.sqrt(np.mean((clear_meas - alpha * clear_clear) ** 2))
 
         alpha = minimize_scalar(rmse).x
-        if round(alpha*10000) == round(previous_alpha*10000):
+        if round(alpha * 10000) == round(previous_alpha * 10000):
             break
     else:
         import warnings
@@ -848,20 +844,20 @@ def bird(zenith, airmass_relative, aod380, aod500, precipitable_water,
     am_press = atmosphere.get_absolute_airmass(airmass, pressure)
     t_rayleigh = (
         np.exp(-0.0903 * am_press ** 0.84 * (
-            1.0 + am_press - am_press ** 1.01
+                1.0 + am_press - am_press ** 1.01
         ))
     )
-    am_o3 = ozone*airmass
+    am_o3 = ozone * airmass
     t_ozone = (
-        1.0 - 0.1611 * am_o3 * (1.0 + 139.48 * am_o3) ** -0.3034 -
-        0.002715 * am_o3 / (1.0 + 0.044 * am_o3 + 0.0003 * am_o3 ** 2.0)
+            1.0 - 0.1611 * am_o3 * (1.0 + 139.48 * am_o3) ** -0.3034 -
+            0.002715 * am_o3 / (1.0 + 0.044 * am_o3 + 0.0003 * am_o3 ** 2.0)
     )
     t_gases = np.exp(-0.0127 * am_press ** 0.26)
     am_h2o = airmass * precipitable_water
     t_water = (
-        1.0 - 2.4959 * am_h2o / (
+            1.0 - 2.4959 * am_h2o / (
             (1.0 + 79.034 * am_h2o) ** 0.6828 + 6.385 * am_h2o
-        )
+    )
     )
     bird_huldstrom = atmosphere.bird_hulstrom80_aod_bb(aod380, aod500)
     t_aerosol = np.exp(
@@ -874,10 +870,10 @@ def bird(zenith, airmass_relative, aod380, aod500, precipitable_water,
     ze_cos = np.where(zenith < 90, np.cos(ze_rad), 0.0)
     id_nh = id_ * ze_cos
     ias = (
-        etr * ze_cos * 0.79 * t_ozone * t_gases * t_water * taa *
-        (0.5 * (1.0 - t_rayleigh) + asymmetry * (1.0 - (t_aerosol / taa))) / (
-            1.0 - airmass + airmass ** 1.02
-        )
+            etr * ze_cos * 0.79 * t_ozone * t_gases * t_water * taa *
+            (0.5 * (1.0 - t_rayleigh) + asymmetry * (1.0 - (t_aerosol / taa))) / (
+                    1.0 - airmass + airmass ** 1.02
+            )
     )
     gh = (id_nh + ias) / (1.0 - albedo * rs)
     diffuse_horiz = gh - id_nh
