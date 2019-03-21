@@ -195,7 +195,6 @@ def lookup_linke_turbidity(time, lats_1d, lons_1d, grid=False, filepath=None,
                                                                    linke_time_interpolation_function(
                                                                        time.timetuple().tm_yday))
 
-
     return linke_turbidity_interpolator(lats_1d, lons_1d, grid=grid)
 
 
@@ -204,14 +203,17 @@ def get_linke_turbidity_world():
     pvlib_path = os.path.dirname(os.path.abspath(__file__))
     filepath = os.path.join(pvlib_path, 'data', 'LinkeTurbidities.h5')
 
-    linke_latitudes = np.arange(-90, 90, 1 / 12)
-    linke_longitudes = np.arange(-180, 180, 1 / 12)
+    linke_latitudes = np.arange(-90+1/24, 90, 1 / 12)
+    linke_longitudes = np.arange(-180+1/24, 180, 1 / 12)
 
     lt_h5_file = tables.open_file(filepath)
     linke_turbidity_all_months = lt_h5_file.root.LinkeTurbidity[:, :, :]
     lt_h5_file.close()
 
-    # add dec before and jan after for easier time interpolation
+    # flip N/S direction
+    linke_turbidity_all_months = linke_turbidity_all_months[::-1, :, :]
+
+    # add dec before and jan after for easier time interpolation later
     linke_turbidity_data = np.dstack((linke_turbidity_all_months[:, :, 11],
                                       linke_turbidity_all_months[:, :, :],
                                       linke_turbidity_all_months[:, :, 0]))
