@@ -180,22 +180,33 @@ def lookup_linke_turbidity(time, lats_1d, lons_1d, grid=False, filepath=None,
     linke_latitudes, linke_longitudes, linke_turbidity_data = get_linke_turbidity_world()
 
     # daynumber for every 15-th day of the month; including a leading dec and trailing jan
-    daynumber = [-15, 15, 46, 74, 105, 135, 166, 196, 227, 258, 288, 319, 349, 379]
+    daynumber = get_daynumber(time)
 
     if time.day <= 15:
         first_index = time.month - 1
     else:
         first_index = time.month
 
-    linke_time_interpolation_function = interpolate.interp1d(daynumber[first_index:first_index + 2],
-                                                             linke_turbidity_data[:, :,
-                                                             first_index:first_index + 2] / 20)
+    linke_time_interpolation_function = interpolate.interp1d(
+        daynumber[first_index:first_index + 2],
+        linke_turbidity_data[:, :, first_index:first_index + 2] / 20
+    )
 
-    linke_turbidity_interpolator = interpolate.RectBivariateSpline(linke_latitudes, linke_longitudes,
-                                                                   linke_time_interpolation_function(
-                                                                       time.timetuple().tm_yday))
+    linke_turbidity_interpolator = interpolate.RectBivariateSpline(
+        linke_latitudes,
+        linke_longitudes,
+        linke_time_interpolation_function(time.timetuple().tm_yday)
+    )
 
     return linke_turbidity_interpolator(lats_1d, lons_1d, grid=grid)
+
+
+def get_daynumber(time):
+    daynumber = [-15, 15, 46, 74, 105, 135, 166, 196, 227, 258, 288, 319, 349, 379]
+    if calendar.isleap(time.year):
+        for i in range(3, len(daynumber)):
+            daynumber[i] += 1
+    return daynumber
 
 
 def get_linke_turbidity_world():
