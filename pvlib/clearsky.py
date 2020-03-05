@@ -184,7 +184,7 @@ def lookup_linke_turbidity(time, lats_1d, lons_1d, grid=False, filepath=None,
 
     linke_time_interpolation_function = interpolate.interp1d(
         daynumber,
-        linke_turbidity_data[:, :, :] / 20,
+        linke_turbidity_data / 20,
     )
 
     linke_turbidity_interpolator = interpolate.RectBivariateSpline(
