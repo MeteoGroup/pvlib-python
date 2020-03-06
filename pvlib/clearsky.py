@@ -182,9 +182,14 @@ def lookup_linke_turbidity(time, lats_1d, lons_1d, grid=False, filepath=None,
     # daynumber for every 15-th day of the month; including a leading dec and trailing jan
     daynumber = get_daynumber(time)
 
+    if time.day <= 15:
+        first_index = time.month - 1
+    else:
+        first_index = time.month
+
     linke_time_interpolation_function = interpolate.interp1d(
-        daynumber,
-        linke_turbidity_data / 20,
+        daynumber[first_index:first_index + 2],
+        linke_turbidity_data[:, :, first_index:first_index + 2] / 20
     )
 
     linke_turbidity_interpolator = interpolate.RectBivariateSpline(
